@@ -8,6 +8,42 @@ enum FocusedField {
     Rename,
 }
 
+fn prev_char_boundary(s: &str, idx: usize) -> usize {
+    if idx == 0 {
+        return 0;
+    }
+    let mut prev = 0;
+    for (i, _) in s.char_indices() {
+        if i >= idx {
+            break;
+        }
+        prev = i;
+    }
+    prev
+}
+
+fn next_char_boundary(s: &str, idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    idx + s[idx..].chars().next().map_or(0, |c| c.len_utf8())
+}
+
+fn cursor_cell(value: &str, cursor: usize) -> String {
+    let cursor = cursor.min(value.len());
+    if cursor < value.len() {
+        let next = next_char_boundary(value, cursor);
+        value[cursor..next].to_string()
+    } else {
+        " ".to_string()
+    }
+}
+
+fn cursor_column(value: &str, cursor: usize) -> i32 {
+    let cursor = cursor.min(value.len());
+    value[..cursor].chars().count() as i32
+}
+
 #[derive(Default, Props)]
 struct AppProps {
     dir: std::path::PathBuf,
@@ -80,6 +116,8 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
 
     let mut match_field = hooks.use_state(|| "(.*)".to_string());
     let mut rename_field = hooks.use_state(|| "$1".to_string());
+    let mut match_cursor = hooks.use_state(|| "(.*)".len());
+    let mut rename_cursor = hooks.use_state(|| "$1".len());
     let mut focused_field = hooks.use_state(|| FocusedField::Match);
 
     let item_count = items.read().len() as i32;
@@ -163,7 +201,12 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                 .unwrap_or_else(|_| Regex::new("^$").unwrap());
 
             match event {
-                TerminalEvent::Key(KeyEvent { code, kind, .. })
+                TerminalEvent::Key(KeyEvent {
+                    code,
+                    kind,
+                    modifiers,
+                    ..
+                })
                     if { kind != KeyEventKind::Release } =>
                 {
                     match code {
@@ -209,6 +252,102 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                             }
 
                             should_exit.set(Some(0));
+                        }
+                        KeyCode::Left => match focused_field.get() {
+                            FocusedField::Match => {
+                                let value = match_field.read().to_string();
+                                let cursor = match_cursor.get();
+                                match_cursor.set(prev_char_boundary(&value, cursor));
+                            }
+                            FocusedField::Rename => {
+                                let value = rename_field.read().to_string();
+                                let cursor = rename_cursor.get();
+                                rename_cursor.set(prev_char_boundary(&value, cursor));
+                            }
+                        },
+                        KeyCode::Right => match focused_field.get() {
+                            FocusedField::Match => {
+                                let value = match_field.read().to_string();
+                                let cursor = match_cursor.get();
+                                match_cursor.set(next_char_boundary(&value, cursor));
+                            }
+                            FocusedField::Rename => {
+                                let value = rename_field.read().to_string();
+                                let cursor = rename_cursor.get();
+                                rename_cursor.set(next_char_boundary(&value, cursor));
+                            }
+                        },
+                        KeyCode::Home => match focused_field.get() {
+                            FocusedField::Match => match_cursor.set(0),
+                            FocusedField::Rename => rename_cursor.set(0),
+                        },
+                        KeyCode::End => match focused_field.get() {
+                            FocusedField::Match => {
+                                match_cursor.set(match_field.read().len());
+                            }
+                            FocusedField::Rename => {
+                                rename_cursor.set(rename_field.read().len());
+                            }
+                        },
+                        KeyCode::Backspace => match focused_field.get() {
+                            FocusedField::Match => {
+                                let mut value = match_field.read().to_string();
+                                let cursor = match_cursor.get();
+                                let prev = prev_char_boundary(&value, cursor);
+                                if prev < cursor {
+                                    value.replace_range(prev..cursor, "");
+                                    match_cursor.set(prev);
+                                    match_field.set(value);
+                                }
+                            }
+                            FocusedField::Rename => {
+                                let mut value = rename_field.read().to_string();
+                                let cursor = rename_cursor.get();
+                                let prev = prev_char_boundary(&value, cursor);
+                                if prev < cursor {
+                                    value.replace_range(prev..cursor, "");
+                                    rename_cursor.set(prev);
+                                    rename_field.set(value);
+                                }
+                            }
+                        },
+                        KeyCode::Delete => match focused_field.get() {
+                            FocusedField::Match => {
+                                let mut value = match_field.read().to_string();
+                                let cursor = match_cursor.get();
+                                let next = next_char_boundary(&value, cursor);
+                                if cursor < next {
+                                    value.replace_range(cursor..next, "");
+                                    match_field.set(value);
+                                }
+                            }
+                            FocusedField::Rename => {
+                                let mut value = rename_field.read().to_string();
+                                let cursor = rename_cursor.get();
+                                let next = next_char_boundary(&value, cursor);
+                                if cursor < next {
+                                    value.replace_range(cursor..next, "");
+                                    rename_field.set(value);
+                                }
+                            }
+                        },
+                        KeyCode::Char(c) if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
+                            match focused_field.get() {
+                                FocusedField::Match => {
+                                    let mut value = match_field.read().to_string();
+                                    let cursor = match_cursor.get().min(value.len());
+                                    value.insert(cursor, c);
+                                    match_cursor.set(cursor + c.len_utf8());
+                                    match_field.set(value);
+                                }
+                                FocusedField::Rename => {
+                                    let mut value = rename_field.read().to_string();
+                                    let cursor = rename_cursor.get().min(value.len());
+                                    value.insert(cursor, c);
+                                    rename_cursor.set(cursor + c.len_utf8());
+                                    rename_field.set(value);
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -336,11 +475,50 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                         padding_left: 1,
                         padding_right: 1,
                     ) {
-                        TextInput(
-                            has_focus: focused_field.get() == FocusedField::Match,
-                            value: match_field.to_string(),
-                            on_change: move |val| match_field.set(val),
-                        )
+                        #({
+                            let has_focus = focused_field.get() == FocusedField::Match;
+                            let value = match_field.read().to_string();
+                            let cursor = match_cursor.get();
+
+                            element! {
+                                View(
+                                    width: Size::Percent(100f32),
+                                    height: 1,
+                                    overflow: Overflow::Hidden,
+                                ) {
+                                    Text(
+                                        wrap: TextWrap::NoWrap,
+                                        content: value.clone(),
+                                    )
+                                    #({
+                                        if has_focus {
+                                            element! {
+                                                View(
+                                                    position: Position::Absolute,
+                                                    top: 0,
+                                                    left: cursor_column(value.as_str(), cursor),
+                                                    width: 1,
+                                                    height: 1,
+                                                    background_color: Color::White,
+                                                    overflow: Overflow::Hidden,
+                                                ) {
+                                                    Text(
+                                                        color: Color::Black,
+                                                        wrap: TextWrap::NoWrap,
+                                                        content: cursor_cell(value.as_str(), cursor),
+                                                    )
+                                                }
+                                            }
+                                            .into_any()
+                                        } else {
+                                            element! { View(width: 0, height: 0) }
+                                                .into_any()
+                                        }
+                                    })
+                                }
+                            }
+                            .into_any()
+                        })
                     }
                 }
                 View(
@@ -366,11 +544,50 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                         padding_left: 1,
                         padding_right: 1,
                     ) {
-                        TextInput(
-                            has_focus: focused_field.get() == FocusedField::Rename,
-                            value: rename_field.to_string(),
-                            on_change: move |val| rename_field.set(val),
-                        )
+                        #({
+                            let has_focus = focused_field.get() == FocusedField::Rename;
+                            let value = rename_field.read().to_string();
+                            let cursor = rename_cursor.get();
+
+                            element! {
+                                View(
+                                    width: Size::Percent(100f32),
+                                    height: 1,
+                                    overflow: Overflow::Hidden,
+                                ) {
+                                    Text(
+                                        wrap: TextWrap::NoWrap,
+                                        content: value.clone(),
+                                    )
+                                    #({
+                                        if has_focus {
+                                            element! {
+                                                View(
+                                                    position: Position::Absolute,
+                                                    top: 0,
+                                                    left: cursor_column(value.as_str(), cursor),
+                                                    width: 1,
+                                                    height: 1,
+                                                    background_color: Color::White,
+                                                    overflow: Overflow::Hidden,
+                                                ) {
+                                                    Text(
+                                                        color: Color::Black,
+                                                        wrap: TextWrap::NoWrap,
+                                                        content: cursor_cell(value.as_str(), cursor),
+                                                    )
+                                                }
+                                            }
+                                            .into_any()
+                                        } else {
+                                            element! { View(width: 0, height: 0) }
+                                                .into_any()
+                                        }
+                                    })
+                                }
+                            }
+                            .into_any()
+                        })
                     }
                 }
             }
