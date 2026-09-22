@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use iocraft::prelude::*;
 use regex::Regex;
 
@@ -18,6 +19,112 @@ enum Modal {
     None,
     Confirm,
     Blocked(SafetyViolation),
+    History { selected_idx: usize },
+}
+
+pub fn escape_history_field(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+pub fn unescape_history_field(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('t') => out.push('\t'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+pub fn get_history_path() -> Option<PathBuf> {
+    if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
+        if !data_home.is_empty() {
+            return Some(PathBuf::from(data_home).join("regname").join("history"));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return Some(PathBuf::from(home).join(".local").join("share").join("regname").join("history"));
+        }
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        if !profile.is_empty() {
+            return Some(PathBuf::from(profile).join(".regname_history"));
+        }
+    }
+    None
+}
+
+pub fn load_history_from_path(path: &Path) -> Vec<(String, String)> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+
+    let mut list = Vec::new();
+    for line in content.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((m, r)) = line.split_once('\t') {
+            list.push((unescape_history_field(m), unescape_history_field(r)));
+        }
+    }
+    list
+}
+
+pub fn save_history_to_path(path: &Path, match_pattern: &str, rename_pattern: &str) {
+    if match_pattern.is_empty() && rename_pattern.is_empty() {
+        return;
+    }
+    let mut history = load_history_from_path(path);
+    history.retain(|(m, r)| m != match_pattern || r != rename_pattern);
+    history.insert(0, (match_pattern.to_string(), rename_pattern.to_string()));
+    history.truncate(100);
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let mut content = String::new();
+    for (m, r) in history {
+        content.push_str(&escape_history_field(&m));
+        content.push('\t');
+        content.push_str(&escape_history_field(&r));
+        content.push('\n');
+    }
+
+    let _ = std::fs::write(path, content);
+}
+
+pub fn load_history() -> Vec<(String, String)> {
+    if let Some(path) = get_history_path() {
+        load_history_from_path(&path)
+    } else {
+        Vec::new()
+    }
+}
+
+pub fn save_history(match_pattern: &str, rename_pattern: &str) {
+    if let Some(path) = get_history_path() {
+        save_history_to_path(&path, match_pattern, rename_pattern);
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,15 +179,18 @@ struct AppProps {
     prevent_delete: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn perform_rename(
     items: &[(bool, String)],
     match_re: &Regex,
+    match_pattern: &str,
     pattern: &str,
     dir: &std::path::Path,
     oprintln: &mut dyn FnMut(&str),
     eprintln: &mut dyn FnMut(&str),
     should_exit: &mut State<Option<i32>>,
 ) {
+    let mut any_renamed = false;
     for (_, filename) in items.iter() {
         if match_re.is_match(filename) && !pattern.is_empty() {
             let renamed = match_re.replace_all(filename, pattern).to_string();
@@ -91,7 +201,9 @@ fn perform_rename(
             let new_path = dir.join(&renamed);
 
             match std::fs::rename(old_path, new_path) {
-                Ok(_) => {}
+                Ok(_) => {
+                    any_renamed = true;
+                }
                 Err(err) => {
                     eprintln(&format!("ERROR: Could not rename file: {}", err));
                     should_exit.set(Some(1));
@@ -99,6 +211,10 @@ fn perform_rename(
                 }
             }
         }
+    }
+
+    if any_renamed {
+        save_history(match_pattern, pattern);
     }
 
     should_exit.set(Some(0));
@@ -168,10 +284,11 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
         items
     });
 
+    let mut history_items = hooks.use_state(Vec::<(String, String)>::new);
     let mut match_field = hooks.use_state(|| "(.*)".to_string());
-    let mut rename_field = hooks.use_state(|| "$1".to_string());
+    let mut rename_field = hooks.use_state(|| "${1}".to_string());
     let mut match_cursor = hooks.use_state(|| "(.*)".len());
-    let mut rename_cursor = hooks.use_state(|| "$1".len());
+    let mut rename_cursor = hooks.use_state(|| "${1}".len());
     let mut focused_field = hooks.use_state(|| FocusedField::Match);
 
     let item_count = items.read().len() as i32;
@@ -267,6 +384,7 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                         Modal::Confirm => {
                             match code {
                                 KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                    let match_pattern = match_field.read().to_string();
                                     let pattern = rename_field.to_string();
                                     if prevent_delete_flag {
                                         if let Err(violation) = check_preflight_safety(
@@ -281,6 +399,7 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                                     perform_rename(
                                         &items.read(),
                                         &match_re,
+                                        &match_pattern,
                                         &pattern,
                                         &dir,
                                         &mut oprintln,
@@ -301,6 +420,7 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                                 KeyCode::Enter => {
                                     match confirm_choice.get() {
                                         ConfirmChoice::Yes => {
+                                            let match_pattern = match_field.read().to_string();
                                             let pattern = rename_field.to_string();
                                             if prevent_delete_flag {
                                                 if let Err(violation) = check_preflight_safety(
@@ -315,6 +435,7 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                                             perform_rename(
                                                 &items.read(),
                                                 &match_re,
+                                                &match_pattern,
                                                 &pattern,
                                                 &dir,
                                                 &mut oprintln,
@@ -343,8 +464,56 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                                 _ => {}
                             }
                         }
+                        Modal::History { selected_idx } => {
+                            let history = history_items.read();
+                            let history_len = history.len();
+                            match code {
+                                KeyCode::Esc => {
+                                    modal.set(Modal::None);
+                                }
+                                KeyCode::Up if selected_idx > 0 => {
+                                    modal.set(Modal::History {
+                                        selected_idx: selected_idx - 1,
+                                    });
+                                }
+                                KeyCode::Down
+                                    if history_len > 0 && selected_idx + 1 < history_len =>
+                                {
+                                    modal.set(Modal::History {
+                                        selected_idx: selected_idx + 1,
+                                    });
+                                }
+                                KeyCode::Char('r') | KeyCode::Char('R')
+                                    if modifiers.contains(KeyModifiers::CONTROL)
+                                        && history_len > 0 =>
+                                {
+                                    let next_idx = (selected_idx + 1) % history_len;
+                                    modal.set(Modal::History {
+                                        selected_idx: next_idx,
+                                    });
+                                }
+                                KeyCode::Enter => {
+                                    if history_len > 0 && selected_idx < history_len {
+                                        let (m, r) = &history[selected_idx];
+                                        match_field.set(m.clone());
+                                        match_cursor.set(m.len());
+                                        rename_field.set(r.clone());
+                                        rename_cursor.set(r.len());
+                                    }
+                                    modal.set(Modal::None);
+                                }
+                                _ => {}
+                            }
+                        }
                         Modal::None => {
                             match code {
+                                KeyCode::Char('r') | KeyCode::Char('R')
+                                    if modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    let items = load_history();
+                                    history_items.set(items);
+                                    modal.set(Modal::History { selected_idx: 0 });
+                                }
                                 KeyCode::Esc => {
                                     should_exit.set(Some(0));
                                 }
@@ -361,6 +530,7 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                                     }
                                 },
                                 KeyCode::Enter => {
+                                    let match_pattern = match_field.read().to_string();
                                     let pattern = rename_field.to_string();
 
                                     if prevent_delete_flag {
@@ -383,6 +553,7 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                                     perform_rename(
                                         &items.read(),
                                         &match_re,
+                                        &match_pattern,
                                         &pattern,
                                         &dir,
                                         &mut oprintln,
@@ -573,6 +744,16 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                                 Text(
                                     color: confirm_fg,
                                     content: confirm_label.to_string(),
+                                )
+                            }
+                            View(
+                                background_color: Color::DarkGrey,
+                                padding_left: 1,
+                                padding_right: 1,
+                            ) {
+                                Text(
+                                    color: Color::White,
+                                    content: "Ctrl+R: HISTORY".to_string(),
                                 )
                             }
                         }
@@ -908,6 +1089,119 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                                     Text(
                                         color: Color::Grey,
                                         content: "(Press Enter, Esc, or Space to dismiss)".to_string(),
+                                    )
+                                }
+                            }
+                        }.into_any()
+                    }
+                    Modal::History { selected_idx } => {
+                        let history = history_items.read();
+                        let modal_width = (width - 4).clamp(42, 78);
+                        let max_visible = 6;
+                        let total = history.len();
+
+                        let (start_idx, end_idx) = if total <= max_visible {
+                            (0, total)
+                        } else {
+                            let half = max_visible / 2;
+                            if selected_idx < half {
+                                (0, max_visible)
+                            } else if selected_idx + (max_visible - half) >= total {
+                                (total - max_visible, total)
+                            } else {
+                                (selected_idx - half, selected_idx - half + max_visible)
+                            }
+                        };
+
+                        let history_elts: Vec<AnyElement<'static>> = if history.is_empty() {
+                            vec![
+                                element! {
+                                    View(
+                                        padding_top: 1,
+                                        padding_bottom: 1,
+                                        align_items: AlignItems::Center,
+                                    ) {
+                                        Text(
+                                            color: Color::Grey,
+                                            content: "No history yet. Successful renames will be saved here.".to_string(),
+                                        )
+                                    }
+                                }.into_any()
+                            ]
+                        } else {
+                            (start_idx..end_idx).map(|i| {
+                                let (m, r) = &history[i];
+                                let is_selected = i == selected_idx;
+                                let prefix = if is_selected { "▸ " } else { "  " };
+                                let line_content = format!("{}{:<24} → {}", prefix, format!("/{}/", m), r);
+
+                                element! {
+                                    View(
+                                        background_color: if is_selected {
+                                            Color::Cyan
+                                        } else {
+                                            Color::Black
+                                        },
+                                        padding_left: 1,
+                                        padding_right: 1,
+                                        width: Size::Percent(100f32),
+                                    ) {
+                                        Text(
+                                            color: if is_selected {
+                                                Color::Black
+                                            } else {
+                                                Color::White
+                                            },
+                                            wrap: TextWrap::NoWrap,
+                                            content: line_content,
+                                        )
+                                    }
+                                }.into_any()
+                            }).collect()
+                        };
+
+                        let footer_text = if history.is_empty() {
+                            "(Press Esc to close)".to_string()
+                        } else {
+                            format!("(↑/↓: select, Enter: load, Esc: cancel | {} of {})", selected_idx + 1, total)
+                        };
+
+                        element! {
+                            View(
+                                position: Position::Absolute,
+                                top: 0,
+                                left: 0,
+                                width,
+                                height,
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                            ) {
+                                View(
+                                    width: modal_width,
+                                    border_style: BorderStyle::Round,
+                                    border_color: Color::Cyan,
+                                    background_color: Color::Black,
+                                    flex_direction: FlexDirection::Column,
+                                    align_items: AlignItems::Center,
+                                    padding_left: 2,
+                                    padding_right: 2,
+                                    padding_top: 1,
+                                    padding_bottom: 1,
+                                    gap: 1,
+                                ) {
+                                    Text(
+                                        color: Color::Cyan,
+                                        content: "Command History (Ctrl+R)".to_string(),
+                                    )
+                                    View(
+                                        flex_direction: FlexDirection::Column,
+                                        width: Size::Percent(100f32),
+                                    ) {
+                                        #(history_elts)
+                                    }
+                                    Text(
+                                        color: Color::Grey,
+                                        content: footer_text,
                                     )
                                 }
                             }
