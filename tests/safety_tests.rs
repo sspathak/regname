@@ -2,7 +2,7 @@
 #[allow(dead_code, unused_imports)]
 mod main_app;
 
-use main_app::{calculate_rename_counts, parse_cli_args};
+use main_app::{calculate_rename_counts, check_preflight_safety, parse_cli_args, SafetyViolation};
 use regex::Regex;
 use std::env;
 
@@ -169,4 +169,49 @@ fn test_calculate_rename_counts_no_match() {
     let (before, after) = calculate_rename_counts(&items, &re, pattern);
     assert_eq!(before, 2);
     assert_eq!(after, 2);
+}
+
+#[test]
+fn test_preflight_safety_normal() {
+    let items = vec![
+        (true, "file1.txt".to_string()),
+        (true, "file2.txt".to_string()),
+    ];
+    let re = Regex::new(r"file(\d)\.txt").unwrap();
+    let pattern = "doc$1.txt";
+    assert_eq!(check_preflight_safety(&items, &re, pattern), Ok(()));
+}
+
+#[test]
+fn test_preflight_safety_chain_collision_blocked() {
+    let items = vec![
+        (true, "test1.txt".to_string()),
+        (true, "test2.txt".to_string()),
+    ];
+    let re = Regex::new(r"test1\.txt").unwrap();
+    let pattern = "test2.txt";
+    let res = check_preflight_safety(&items, &re, pattern);
+    assert!(matches!(res, Err(SafetyViolation::CountDecrease { .. } | SafetyViolation::ChainCollision { .. })));
+}
+
+#[test]
+fn test_preflight_safety_swap_collision_blocked() {
+    let items = vec![
+        (true, "x.txt".to_string()),
+        (true, "y.txt".to_string()),
+    ];
+    let re = Regex::new(r"^x\.txt$").unwrap();
+    let pattern = "y.txt";
+    assert!(check_preflight_safety(&items, &re, pattern).is_err());
+}
+
+#[test]
+fn test_preflight_safety_no_op_allowed() {
+    let items = vec![
+        (true, "x.txt".to_string()),
+        (true, "y.txt".to_string()),
+    ];
+    let re = Regex::new(r".*").unwrap();
+    let pattern = "$0";
+    assert_eq!(check_preflight_safety(&items, &re, pattern), Ok(()));
 }

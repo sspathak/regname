@@ -7,11 +7,17 @@ enum FocusedField {
     Rename,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SafetyViolation {
+    CountDecrease { before: usize, after: usize },
+    ChainCollision { source: String, target: String },
+}
+
+#[derive(Clone, PartialEq, Eq)]
 enum Modal {
     None,
     Confirm,
-    Blocked { before: usize, after: usize },
+    Blocked(SafetyViolation),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -256,20 +262,21 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                     modifiers,
                     ..
                 }) if kind != KeyEventKind::Release => {
-                    let current_modal = modal.get();
+                    let current_modal = modal.read().clone();
                     match current_modal {
                         Modal::Confirm => {
                             match code {
                                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                                     let pattern = rename_field.to_string();
-                                    let (before, after) = calculate_rename_counts(
-                                        &items.read(),
-                                        &match_re,
-                                        &pattern,
-                                    );
-                                    if prevent_delete_flag && after < before {
-                                        modal.set(Modal::Blocked { before, after });
-                                        return;
+                                    if prevent_delete_flag {
+                                        if let Err(violation) = check_preflight_safety(
+                                            &items.read(),
+                                            &match_re,
+                                            &pattern,
+                                        ) {
+                                            modal.set(Modal::Blocked(violation));
+                                            return;
+                                        }
                                     }
                                     perform_rename(
                                         &items.read(),
@@ -295,14 +302,15 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                                     match confirm_choice.get() {
                                         ConfirmChoice::Yes => {
                                             let pattern = rename_field.to_string();
-                                            let (before, after) = calculate_rename_counts(
-                                                &items.read(),
-                                                &match_re,
-                                                &pattern,
-                                            );
-                                            if prevent_delete_flag && after < before {
-                                                modal.set(Modal::Blocked { before, after });
-                                                return;
+                                            if prevent_delete_flag {
+                                                if let Err(violation) = check_preflight_safety(
+                                                    &items.read(),
+                                                    &match_re,
+                                                    &pattern,
+                                                ) {
+                                                    modal.set(Modal::Blocked(violation));
+                                                    return;
+                                                }
                                             }
                                             perform_rename(
                                                 &items.read(),
@@ -351,15 +359,16 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                                 },
                                 KeyCode::Enter => {
                                     let pattern = rename_field.to_string();
-                                    let (before, after) = calculate_rename_counts(
-                                        &items.read(),
-                                        &match_re,
-                                        &pattern,
-                                    );
 
-                                    if prevent_delete_flag && after < before {
-                                        modal.set(Modal::Blocked { before, after });
-                                        return;
+                                    if prevent_delete_flag {
+                                        if let Err(violation) = check_preflight_safety(
+                                            &items.read(),
+                                            &match_re,
+                                            &pattern,
+                                        ) {
+                                            modal.set(Modal::Blocked(violation));
+                                            return;
+                                        }
                                     }
 
                                     if confirm_flag {
@@ -722,7 +731,7 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                 }
             }
             #({
-                match modal.get() {
+                match modal.read().clone() {
                     Modal::None => element! { View(width: 0, height: 0) }.into_any(),
                     Modal::Confirm => element! {
                         View(
@@ -799,47 +808,62 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                             }
                         }
                     }.into_any(),
-                    Modal::Blocked { before, after } => element! {
-                        View(
-                            position: Position::Absolute,
-                            top: 0,
-                            left: 0,
-                            width,
-                            height,
-                            justify_content: JustifyContent::Center,
-                            align_items: AlignItems::Center,
-                        ) {
+                    Modal::Blocked(ref violation) => {
+                        let (title, line1, line2) = match violation {
+                            SafetyViolation::CountDecrease { before, after } => (
+                                "CANNOT EXECUTE RENAME".to_string(),
+                                format!("File count would decrease from {} to {}.", before, after),
+                                "Files would be overwritten or deleted.".to_string(),
+                            ),
+                            SafetyViolation::ChainCollision { source, target } => (
+                                "CANNOT EXECUTE RENAME: CHAIN COLLISION".to_string(),
+                                format!("'{}' renames to existing '{}'.", source, target),
+                                "Sequential rename would overwrite file before it is moved.".to_string(),
+                            ),
+                        };
+
+                        element! {
                             View(
-                                width: (width - 4).clamp(36, 64),
-                                height: 8,
-                                border_style: BorderStyle::Round,
-                                border_color: Color::Red,
-                                background_color: Color::Black,
-                                flex_direction: FlexDirection::Column,
+                                position: Position::Absolute,
+                                top: 0,
+                                left: 0,
+                                width,
+                                height,
+                                justify_content: JustifyContent::Center,
                                 align_items: AlignItems::Center,
-                                justify_content: JustifyContent::SpaceAround,
-                                padding_left: 2,
-                                padding_right: 2,
                             ) {
-                                Text(
-                                    color: Color::Red,
-                                    content: "CANNOT EXECUTE RENAME".to_string(),
-                                )
-                                Text(
-                                    color: Color::White,
-                                    content: format!("File count would decrease from {} to {}.", before, after),
-                                )
-                                Text(
-                                    color: Color::Yellow,
-                                    content: "Files would be overwritten or deleted.".to_string(),
-                                )
-                                Text(
-                                    color: Color::Grey,
-                                    content: "(Press Enter, Esc, or Space to dismiss)".to_string(),
-                                )
+                                View(
+                                    width: (width - 4).clamp(36, 68),
+                                    height: 8,
+                                    border_style: BorderStyle::Round,
+                                    border_color: Color::Red,
+                                    background_color: Color::Black,
+                                    flex_direction: FlexDirection::Column,
+                                    align_items: AlignItems::Center,
+                                    justify_content: JustifyContent::SpaceAround,
+                                    padding_left: 2,
+                                    padding_right: 2,
+                                ) {
+                                    Text(
+                                        color: Color::Red,
+                                        content: title,
+                                    )
+                                    Text(
+                                        color: Color::White,
+                                        content: line1,
+                                    )
+                                    Text(
+                                        color: Color::Yellow,
+                                        content: line2,
+                                    )
+                                    Text(
+                                        color: Color::Grey,
+                                        content: "(Press Enter, Esc, or Space to dismiss)".to_string(),
+                                    )
+                                }
                             }
-                        }
-                    }.into_any(),
+                        }.into_any()
+                    }
                 }
             })
         }
@@ -865,6 +889,42 @@ pub fn calculate_rename_counts(
         }
     }
     (before_count, after_filenames.len())
+}
+
+pub fn check_preflight_safety(
+    items: &[(bool, String)],
+    match_re: &Regex,
+    pattern: &str,
+) -> Result<(), SafetyViolation> {
+    let (before, after) = calculate_rename_counts(items, match_re, pattern);
+    if after < before {
+        return Err(SafetyViolation::CountDecrease { before, after });
+    }
+
+    if pattern.is_empty() {
+        return Ok(());
+    }
+
+    let mut sources = std::collections::HashSet::new();
+    let mut renames = Vec::new();
+
+    for (_, filename) in items {
+        if match_re.is_match(filename) {
+            let renamed = match_re.replace_all(filename, pattern).to_string();
+            if &renamed != filename {
+                sources.insert(filename.clone());
+                renames.push((filename.clone(), renamed));
+            }
+        }
+    }
+
+    for (source, target) in renames {
+        if sources.contains(&target) {
+            return Err(SafetyViolation::ChainCollision { source, target });
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
