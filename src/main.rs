@@ -345,6 +345,9 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                         }
                         Modal::None => {
                             match code {
+                                KeyCode::Esc => {
+                                    should_exit.set(Some(0));
+                                }
                                 KeyCode::Up => scroll_offset.set((scroll_offset.get() - 1).max(0)),
                                 KeyCode::Down => {
                                     scroll_offset.set((scroll_offset.get() + 1).min(item_count - 1))
@@ -529,6 +532,52 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                 ) {
                     TextInput(value: format!("{}", props.dir.display()))
                 }
+                #({
+                    let (safe_label, safe_bg, safe_fg) = if !props.prevent_delete && !props.confirm {
+                        ("⚠️ UNSAFE", Color::Red, Color::White)
+                    } else if !props.prevent_delete {
+                        ("⚠️ OVERWRITE", Color::Red, Color::White)
+                    } else {
+                        ("🛡️ SAFE", Color::DarkGrey, Color::Cyan)
+                    };
+
+                    let (confirm_label, confirm_bg, confirm_fg) = if props.confirm {
+                        ("✓ CONFIRM", Color::DarkGrey, Color::Green)
+                    } else {
+                        ("⚡ NO-CONFIRM", Color::DarkGrey, Color::Yellow)
+                    };
+
+                    element! {
+                        View(
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            gap: 1,
+                            padding_left: 1,
+                            padding_right: 1,
+                        ) {
+                            View(
+                                background_color: safe_bg,
+                                padding_left: 1,
+                                padding_right: 1,
+                            ) {
+                                Text(
+                                    color: safe_fg,
+                                    content: safe_label.to_string(),
+                                )
+                            }
+                            View(
+                                background_color: confirm_bg,
+                                padding_left: 1,
+                                padding_right: 1,
+                            ) {
+                                Text(
+                                    color: confirm_fg,
+                                    content: confirm_label.to_string(),
+                                )
+                            }
+                        }
+                    }.into_any()
+                })
             }
             View(
                 width: Size::Percent(100f32),
@@ -941,8 +990,8 @@ where
     T: AsRef<str>,
 {
     let mut dir: Option<std::path::PathBuf> = None;
-    let mut confirm = false;
-    let mut prevent_delete = false;
+    let mut confirm = true;
+    let mut prevent_delete = true;
     let mut help = false;
 
     for arg in args {
@@ -951,11 +1000,20 @@ where
             "-h" | "--help" => {
                 help = true;
             }
+            "--no-confirm" | "-y" | "--yes" => {
+                confirm = false;
+            }
+            "--overwrite" | "--force" | "-f" => {
+                prevent_delete = false;
+            }
+            "--unsafe" => {
+                confirm = false;
+                prevent_delete = false;
+            }
             "-c" | "--confirm" | "-i" | "--interactive" => {
                 confirm = true;
             }
             "-s" | "--safe" => {
-                // --safe and -s also enable the confirm flag
                 confirm = true;
                 prevent_delete = true;
             }
@@ -1003,12 +1061,18 @@ pub fn print_help() {
     println!("    regname [OPTIONS] [DIR]");
     println!();
     println!("OPTIONS:");
+    println!("    Safe mode is enabled by default (prompts for confirmation and blocks file overwrites).");
+    println!();
+    println!("    -y, --no-confirm, --yes");
+    println!("            Skip confirmation pop-up dialog");
+    println!("    -f, --force, --overwrite");
+    println!("            Allow renaming even if files would be overwritten or deleted");
+    println!("    --unsafe");
+    println!("            Bypass all safety checks (disables both confirmation and overwrite guard)");
     println!("    -c, --confirm, -i, --interactive");
-    println!("            Prompt for confirmation with a pop-up before executing rename");
-    println!("    -p, --prevent-delete, -n, --no-overwrite");
-    println!("            Prevent rename if before and after file count decreases");
-    println!("    -s, --safe");
-    println!("            Safe mode: enables both --prevent-delete and --confirm");
+    println!("            Require confirmation pop-up (enabled by default)");
+    println!("    -p, --prevent-delete, -n, --no-overwrite, -s, --safe");
+    println!("            Block overwriting/deletion (enabled by default)");
     println!("    -h, --help");
     println!("            Print help information");
 }

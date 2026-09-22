@@ -10,8 +10,8 @@ use std::env;
 fn test_parse_cli_args_defaults() {
     let args: Vec<&str> = vec![];
     let parsed = parse_cli_args(args).expect("failed to parse empty args");
-    assert!(!parsed.confirm);
-    assert!(!parsed.prevent_delete);
+    assert!(parsed.confirm, "confirm should be enabled by default");
+    assert!(parsed.prevent_delete, "prevent_delete should be enabled by default");
     assert!(!parsed.help);
     assert_eq!(
         parsed.dir,
@@ -20,41 +20,36 @@ fn test_parse_cli_args_defaults() {
 }
 
 #[test]
-fn test_parse_cli_args_confirm_flags() {
-    for flag in &["-c", "--confirm", "-i", "--interactive"] {
-        let parsed = parse_cli_args(vec![*flag]).expect("failed to parse confirm flag");
-        assert!(parsed.confirm, "flag {} should enable confirm", flag);
-        assert!(
-            !parsed.prevent_delete,
-            "flag {} should not enable prevent_delete",
-            flag
-        );
+fn test_parse_cli_args_no_confirm_flags() {
+    for flag in &["--no-confirm", "-y", "--yes"] {
+        let parsed = parse_cli_args(vec![*flag]).expect("failed to parse no-confirm flag");
+        assert!(!parsed.confirm, "flag {} should disable confirm", flag);
+        assert!(parsed.prevent_delete, "flag {} should leave prevent_delete enabled", flag);
     }
 }
 
 #[test]
-fn test_parse_cli_args_prevent_delete_flags() {
-    for flag in &["-p", "--prevent-delete", "-n", "--no-overwrite", "--prevent-overwrite"] {
-        let parsed = parse_cli_args(vec![*flag]).expect("failed to parse prevent-delete flag");
-        assert!(
-            parsed.prevent_delete,
-            "flag {} should enable prevent_delete",
-            flag
-        );
-        assert!(!parsed.confirm, "flag {} should not enable confirm", flag);
+fn test_parse_cli_args_force_overwrite_flags() {
+    for flag in &["--overwrite", "--force", "-f"] {
+        let parsed = parse_cli_args(vec![*flag]).expect("failed to parse force flag");
+        assert!(!parsed.prevent_delete, "flag {} should disable prevent_delete", flag);
+        assert!(parsed.confirm, "flag {} should leave confirm enabled", flag);
     }
 }
 
 #[test]
-fn test_parse_cli_args_safe_flag_enables_both() {
-    for flag in &["-s", "--safe"] {
+fn test_parse_cli_args_unsafe_flag() {
+    let parsed = parse_cli_args(vec!["--unsafe"]).expect("failed to parse --unsafe");
+    assert!(!parsed.confirm, "--unsafe should disable confirm");
+    assert!(!parsed.prevent_delete, "--unsafe should disable prevent_delete");
+}
+
+#[test]
+fn test_parse_cli_args_explicit_safe_flags() {
+    for flag in &["-s", "--safe", "-c", "--confirm", "-p", "--prevent-delete"] {
         let parsed = parse_cli_args(vec![*flag]).expect("failed to parse safe flag");
-        assert!(parsed.confirm, "flag {} should enable confirm", flag);
-        assert!(
-            parsed.prevent_delete,
-            "flag {} should enable prevent_delete",
-            flag
-        );
+        assert!(parsed.confirm);
+        assert!(parsed.prevent_delete);
     }
 }
 
