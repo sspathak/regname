@@ -1,11 +1,23 @@
 use iocraft::prelude::*;
 use regex::Regex;
-use smol;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum FocusedField {
     Match,
     Rename,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Modal {
+    None,
+    Confirm,
+    Blocked { before: usize, after: usize },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfirmChoice {
+    Yes,
+    No,
 }
 
 fn prev_char_boundary(s: &str, idx: usize) -> usize {
@@ -50,6 +62,40 @@ struct AppProps {
     exit_code: i32,
     out_buffer: String,
     err_buffer: String,
+    confirm: bool,
+    prevent_delete: bool,
+}
+
+fn perform_rename(
+    items: &[(bool, String)],
+    match_re: &Regex,
+    pattern: &str,
+    dir: &std::path::Path,
+    oprintln: &mut dyn FnMut(&str),
+    eprintln: &mut dyn FnMut(&str),
+    should_exit: &mut State<Option<i32>>,
+) {
+    for (_, filename) in items.iter() {
+        if match_re.is_match(filename) && !pattern.is_empty() {
+            let renamed = match_re.replace_all(filename, pattern).to_string();
+
+            oprintln(&format!("{} -> {}", filename, renamed));
+
+            let old_path = dir.join(filename);
+            let new_path = dir.join(&renamed);
+
+            match std::fs::rename(old_path, new_path) {
+                Ok(_) => {}
+                Err(err) => {
+                    eprintln(&format!("ERROR: Could not rename file: {}", err));
+                    should_exit.set(Some(1));
+                    return;
+                }
+            }
+        }
+    }
+
+    should_exit.set(Some(0));
 }
 
 #[component]
@@ -57,10 +103,12 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
     let (width, height) = hooks.use_terminal_size();
     let mut system = hooks.use_context_mut::<SystemContext>();
 
-    let mut out_buffer = hooks.use_state(|| String::new());
-    let mut err_buffer = hooks.use_state(|| String::new());
+    let mut out_buffer = hooks.use_state(String::new);
+    let mut err_buffer = hooks.use_state(String::new);
     let mut should_exit = hooks.use_state::<Option<i32>, _>(|| None);
     let mut scroll_offset = hooks.use_state(|| 0);
+    let mut modal = hooks.use_state(|| Modal::None);
+    let mut confirm_choice = hooks.use_state(|| ConfirmChoice::Yes);
 
     let mut eprintln = |msg: &str| {
         err_buffer.set(format!("{}{}\n", err_buffer.read().as_str(), msg));
@@ -168,8 +216,7 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                         content: label,
                     )
                 }
-            }
-            else {
+            } else {
                 let label = if *is_file {
                     format!("📄 {}", filename)
                 } else {
@@ -188,6 +235,8 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
 
     hooks.use_terminal_events({
         let dir = props.dir.clone();
+        let confirm_flag = props.confirm;
+        let prevent_delete_flag = props.prevent_delete;
 
         move |event| {
             let mut oprintln = |msg: &str| {
@@ -206,150 +255,231 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                     kind,
                     modifiers,
                     ..
-                })
-                    if { kind != KeyEventKind::Release } =>
-                {
-                    match code {
-                        KeyCode::Up => scroll_offset.set((scroll_offset.get() - 1).max(0)),
-                        KeyCode::Down => {
-                            scroll_offset.set((scroll_offset.get() + 1).min(item_count - 1))
-                        }
-                        KeyCode::Tab => match focused_field.get() {
-                            FocusedField::Match => {
-                                focused_field.set(FocusedField::Rename);
-                            }
-                            FocusedField::Rename => {
-                                focused_field.set(FocusedField::Match);
-                            }
-                        },
-                        KeyCode::Enter => {
-                            let pattern = rename_field.to_string();
-
-                            for (_, filename) in items.read().iter() {
-                                if match_re.is_match(filename) && !pattern.is_empty() {
-                                    let renamed = match_re.replace_all(
-                                        filename,
+                }) if kind != KeyEventKind::Release => {
+                    let current_modal = modal.get();
+                    match current_modal {
+                        Modal::Confirm => {
+                            match code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                    let pattern = rename_field.to_string();
+                                    let (before, after) = calculate_rename_counts(
+                                        &items.read(),
+                                        &match_re,
                                         &pattern,
-                                    ).to_string();
-
-                                    oprintln(&format!("{} -> {}", filename, renamed));
-
-                                    let old_path = dir.join(filename);
-                                    let new_path = dir.join(&renamed);
-
-                                    match std::fs::rename(old_path, new_path) {
-                                        Ok(_) => {}
-                                        Err(err) => {
-                                            eprintln(&format!(
-                                                "ERROR: Could not rename file: {}",
-                                                err,
-                                            ));
-                                            should_exit.set(Some(1));
-                                            break;
+                                    );
+                                    if prevent_delete_flag && after < before {
+                                        modal.set(Modal::Blocked { before, after });
+                                        return;
+                                    }
+                                    perform_rename(
+                                        &items.read(),
+                                        &match_re,
+                                        &pattern,
+                                        &dir,
+                                        &mut oprintln,
+                                        &mut eprintln,
+                                        &mut should_exit,
+                                    );
+                                }
+                                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                    // Dismiss confirmation modal and return to active editing
+                                    modal.set(Modal::None);
+                                }
+                                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                                    confirm_choice.set(match confirm_choice.get() {
+                                        ConfirmChoice::Yes => ConfirmChoice::No,
+                                        ConfirmChoice::No => ConfirmChoice::Yes,
+                                    });
+                                }
+                                KeyCode::Enter => {
+                                    match confirm_choice.get() {
+                                        ConfirmChoice::Yes => {
+                                            let pattern = rename_field.to_string();
+                                            let (before, after) = calculate_rename_counts(
+                                                &items.read(),
+                                                &match_re,
+                                                &pattern,
+                                            );
+                                            if prevent_delete_flag && after < before {
+                                                modal.set(Modal::Blocked { before, after });
+                                                return;
+                                            }
+                                            perform_rename(
+                                                &items.read(),
+                                                &match_re,
+                                                &pattern,
+                                                &dir,
+                                                &mut oprintln,
+                                                &mut eprintln,
+                                                &mut should_exit,
+                                            );
+                                        }
+                                        ConfirmChoice::No => {
+                                            // Dismiss modal without executing
+                                            modal.set(Modal::None);
                                         }
                                     }
                                 }
+                                _ => {}
                             }
+                        }
+                        Modal::Blocked { .. } => {
+                            match code {
+                                KeyCode::Enter
+                                | KeyCode::Esc
+                                | KeyCode::Char(' ')
+                                | KeyCode::Char('o')
+                                | KeyCode::Char('O') => {
+                                    modal.set(Modal::None);
+                                }
+                                _ => {}
+                            }
+                        }
+                        Modal::None => {
+                            match code {
+                                KeyCode::Up => scroll_offset.set((scroll_offset.get() - 1).max(0)),
+                                KeyCode::Down => {
+                                    scroll_offset.set((scroll_offset.get() + 1).min(item_count - 1))
+                                }
+                                KeyCode::Tab => match focused_field.get() {
+                                    FocusedField::Match => {
+                                        focused_field.set(FocusedField::Rename);
+                                    }
+                                    FocusedField::Rename => {
+                                        focused_field.set(FocusedField::Match);
+                                    }
+                                },
+                                KeyCode::Enter => {
+                                    let pattern = rename_field.to_string();
+                                    let (before, after) = calculate_rename_counts(
+                                        &items.read(),
+                                        &match_re,
+                                        &pattern,
+                                    );
 
-                            should_exit.set(Some(0));
+                                    if prevent_delete_flag && after < before {
+                                        modal.set(Modal::Blocked { before, after });
+                                        return;
+                                    }
+
+                                    if confirm_flag {
+                                        confirm_choice.set(ConfirmChoice::Yes);
+                                        modal.set(Modal::Confirm);
+                                        return;
+                                    }
+
+                                    perform_rename(
+                                        &items.read(),
+                                        &match_re,
+                                        &pattern,
+                                        &dir,
+                                        &mut oprintln,
+                                        &mut eprintln,
+                                        &mut should_exit,
+                                    );
+                                }
+                                KeyCode::Left => match focused_field.get() {
+                                    FocusedField::Match => {
+                                        let value = match_field.read().to_string();
+                                        let cursor = match_cursor.get();
+                                        match_cursor.set(prev_char_boundary(&value, cursor));
+                                    }
+                                    FocusedField::Rename => {
+                                        let value = rename_field.read().to_string();
+                                        let cursor = rename_cursor.get();
+                                        rename_cursor.set(prev_char_boundary(&value, cursor));
+                                    }
+                                },
+                                KeyCode::Right => match focused_field.get() {
+                                    FocusedField::Match => {
+                                        let value = match_field.read().to_string();
+                                        let cursor = match_cursor.get();
+                                        match_cursor.set(next_char_boundary(&value, cursor));
+                                    }
+                                    FocusedField::Rename => {
+                                        let value = rename_field.read().to_string();
+                                        let cursor = rename_cursor.get();
+                                        rename_cursor.set(next_char_boundary(&value, cursor));
+                                    }
+                                },
+                                KeyCode::Home => match focused_field.get() {
+                                    FocusedField::Match => match_cursor.set(0),
+                                    FocusedField::Rename => rename_cursor.set(0),
+                                },
+                                KeyCode::End => match focused_field.get() {
+                                    FocusedField::Match => {
+                                        match_cursor.set(match_field.read().len());
+                                    }
+                                    FocusedField::Rename => {
+                                        rename_cursor.set(rename_field.read().len());
+                                    }
+                                },
+                                KeyCode::Backspace => match focused_field.get() {
+                                    FocusedField::Match => {
+                                        let mut value = match_field.read().to_string();
+                                        let cursor = match_cursor.get();
+                                        let prev = prev_char_boundary(&value, cursor);
+                                        if prev < cursor {
+                                            value.replace_range(prev..cursor, "");
+                                            match_cursor.set(prev);
+                                            match_field.set(value);
+                                        }
+                                    }
+                                    FocusedField::Rename => {
+                                        let mut value = rename_field.read().to_string();
+                                        let cursor = rename_cursor.get();
+                                        let prev = prev_char_boundary(&value, cursor);
+                                        if prev < cursor {
+                                            value.replace_range(prev..cursor, "");
+                                            rename_cursor.set(prev);
+                                            rename_field.set(value);
+                                        }
+                                    }
+                                },
+                                KeyCode::Delete => match focused_field.get() {
+                                    FocusedField::Match => {
+                                        let mut value = match_field.read().to_string();
+                                        let cursor = match_cursor.get();
+                                        let next = next_char_boundary(&value, cursor);
+                                        if cursor < next {
+                                            value.replace_range(cursor..next, "");
+                                            match_field.set(value);
+                                        }
+                                    }
+                                    FocusedField::Rename => {
+                                        let mut value = rename_field.read().to_string();
+                                        let cursor = rename_cursor.get();
+                                        let next = next_char_boundary(&value, cursor);
+                                        if cursor < next {
+                                            value.replace_range(cursor..next, "");
+                                            rename_field.set(value);
+                                        }
+                                    }
+                                },
+                                KeyCode::Char(c)
+                                    if modifiers.is_empty()
+                                        || modifiers == KeyModifiers::SHIFT =>
+                                {
+                                    match focused_field.get() {
+                                        FocusedField::Match => {
+                                            let mut value = match_field.read().to_string();
+                                            let cursor = match_cursor.get().min(value.len());
+                                            value.insert(cursor, c);
+                                            match_cursor.set(cursor + c.len_utf8());
+                                            match_field.set(value);
+                                        }
+                                        FocusedField::Rename => {
+                                            let mut value = rename_field.read().to_string();
+                                            let cursor = rename_cursor.get().min(value.len());
+                                            value.insert(cursor, c);
+                                            rename_cursor.set(cursor + c.len_utf8());
+                                            rename_field.set(value);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
-                        KeyCode::Left => match focused_field.get() {
-                            FocusedField::Match => {
-                                let value = match_field.read().to_string();
-                                let cursor = match_cursor.get();
-                                match_cursor.set(prev_char_boundary(&value, cursor));
-                            }
-                            FocusedField::Rename => {
-                                let value = rename_field.read().to_string();
-                                let cursor = rename_cursor.get();
-                                rename_cursor.set(prev_char_boundary(&value, cursor));
-                            }
-                        },
-                        KeyCode::Right => match focused_field.get() {
-                            FocusedField::Match => {
-                                let value = match_field.read().to_string();
-                                let cursor = match_cursor.get();
-                                match_cursor.set(next_char_boundary(&value, cursor));
-                            }
-                            FocusedField::Rename => {
-                                let value = rename_field.read().to_string();
-                                let cursor = rename_cursor.get();
-                                rename_cursor.set(next_char_boundary(&value, cursor));
-                            }
-                        },
-                        KeyCode::Home => match focused_field.get() {
-                            FocusedField::Match => match_cursor.set(0),
-                            FocusedField::Rename => rename_cursor.set(0),
-                        },
-                        KeyCode::End => match focused_field.get() {
-                            FocusedField::Match => {
-                                match_cursor.set(match_field.read().len());
-                            }
-                            FocusedField::Rename => {
-                                rename_cursor.set(rename_field.read().len());
-                            }
-                        },
-                        KeyCode::Backspace => match focused_field.get() {
-                            FocusedField::Match => {
-                                let mut value = match_field.read().to_string();
-                                let cursor = match_cursor.get();
-                                let prev = prev_char_boundary(&value, cursor);
-                                if prev < cursor {
-                                    value.replace_range(prev..cursor, "");
-                                    match_cursor.set(prev);
-                                    match_field.set(value);
-                                }
-                            }
-                            FocusedField::Rename => {
-                                let mut value = rename_field.read().to_string();
-                                let cursor = rename_cursor.get();
-                                let prev = prev_char_boundary(&value, cursor);
-                                if prev < cursor {
-                                    value.replace_range(prev..cursor, "");
-                                    rename_cursor.set(prev);
-                                    rename_field.set(value);
-                                }
-                            }
-                        },
-                        KeyCode::Delete => match focused_field.get() {
-                            FocusedField::Match => {
-                                let mut value = match_field.read().to_string();
-                                let cursor = match_cursor.get();
-                                let next = next_char_boundary(&value, cursor);
-                                if cursor < next {
-                                    value.replace_range(cursor..next, "");
-                                    match_field.set(value);
-                                }
-                            }
-                            FocusedField::Rename => {
-                                let mut value = rename_field.read().to_string();
-                                let cursor = rename_cursor.get();
-                                let next = next_char_boundary(&value, cursor);
-                                if cursor < next {
-                                    value.replace_range(cursor..next, "");
-                                    rename_field.set(value);
-                                }
-                            }
-                        },
-                        KeyCode::Char(c) if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
-                            match focused_field.get() {
-                                FocusedField::Match => {
-                                    let mut value = match_field.read().to_string();
-                                    let cursor = match_cursor.get().min(value.len());
-                                    value.insert(cursor, c);
-                                    match_cursor.set(cursor + c.len_utf8());
-                                    match_field.set(value);
-                                }
-                                FocusedField::Rename => {
-                                    let mut value = rename_field.read().to_string();
-                                    let cursor = rename_cursor.get().min(value.len());
-                                    value.insert(cursor, c);
-                                    rename_cursor.set(cursor + c.len_utf8());
-                                    rename_field.set(value);
-                                }
-                            }
-                        }
-                        _ => {}
                     }
                 }
                 _ => {}
@@ -591,31 +721,260 @@ fn App(props: &mut AppProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>>
                     }
                 }
             }
+            #({
+                match modal.get() {
+                    Modal::None => element! { View(width: 0, height: 0) }.into_any(),
+                    Modal::Confirm => element! {
+                        View(
+                            position: Position::Absolute,
+                            top: 0,
+                            left: 0,
+                            width,
+                            height,
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                        ) {
+                            View(
+                                width: (width - 4).clamp(36, 58),
+                                height: 7,
+                                border_style: BorderStyle::Round,
+                                border_color: Color::Yellow,
+                                background_color: Color::Black,
+                                flex_direction: FlexDirection::Column,
+                                align_items: AlignItems::Center,
+                                justify_content: JustifyContent::SpaceAround,
+                                padding_left: 2,
+                                padding_right: 2,
+                            ) {
+                                Text(
+                                    color: Color::White,
+                                    content: "Are you sure you want to execute this rename?".to_string(),
+                                )
+                                View(
+                                    flex_direction: FlexDirection::Row,
+                                    justify_content: JustifyContent::Center,
+                                    gap: 3,
+                                ) {
+                                    View(
+                                        background_color: if confirm_choice.get() == ConfirmChoice::Yes {
+                                            Color::Cyan
+                                        } else {
+                                            Color::DarkGrey
+                                        },
+                                        padding_left: 1,
+                                        padding_right: 1,
+                                    ) {
+                                        Text(
+                                            color: if confirm_choice.get() == ConfirmChoice::Yes {
+                                                Color::Black
+                                            } else {
+                                                Color::White
+                                            },
+                                            content: "Yes (y)".to_string(),
+                                        )
+                                    }
+                                    View(
+                                        background_color: if confirm_choice.get() == ConfirmChoice::No {
+                                            Color::Cyan
+                                        } else {
+                                            Color::DarkGrey
+                                        },
+                                        padding_left: 1,
+                                        padding_right: 1,
+                                    ) {
+                                        Text(
+                                            color: if confirm_choice.get() == ConfirmChoice::No {
+                                                Color::Black
+                                            } else {
+                                                Color::White
+                                            },
+                                            content: "No (n / Esc)".to_string(),
+                                        )
+                                    }
+                                }
+                                Text(
+                                    color: Color::Grey,
+                                    content: "(Press 'y' to confirm, 'n' or Esc to cancel)".to_string(),
+                                )
+                            }
+                        }
+                    }.into_any(),
+                    Modal::Blocked { before, after } => element! {
+                        View(
+                            position: Position::Absolute,
+                            top: 0,
+                            left: 0,
+                            width,
+                            height,
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                        ) {
+                            View(
+                                width: (width - 4).clamp(36, 64),
+                                height: 8,
+                                border_style: BorderStyle::Round,
+                                border_color: Color::Red,
+                                background_color: Color::Black,
+                                flex_direction: FlexDirection::Column,
+                                align_items: AlignItems::Center,
+                                justify_content: JustifyContent::SpaceAround,
+                                padding_left: 2,
+                                padding_right: 2,
+                            ) {
+                                Text(
+                                    color: Color::Red,
+                                    content: "CANNOT EXECUTE RENAME".to_string(),
+                                )
+                                Text(
+                                    color: Color::White,
+                                    content: format!("File count would decrease from {} to {}.", before, after),
+                                )
+                                Text(
+                                    color: Color::Yellow,
+                                    content: "Files would be overwritten or deleted.".to_string(),
+                                )
+                                Text(
+                                    color: Color::Grey,
+                                    content: "(Press Enter, Esc, or Space to dismiss)".to_string(),
+                                )
+                            }
+                        }
+                    }.into_any(),
+                }
+            })
         }
     }
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let dir = args
-        .get(1)
-        .map(|s| match std::path::PathBuf::from(s).canonicalize() {
-            Ok(path) => path,
-            Err(err) => {
-                eprintln!("ERROR: {}", err);
-                std::process::exit(1);
-            },
-        })
-        .or_else(|| match std::env::current_dir() {
-            Ok(path) => Some(path),
-            Err(err) => {
-                eprintln!("ERROR: {}", err);
-                std::process::exit(1);
-            },
-        })
-        .unwrap();
+pub fn calculate_rename_counts(
+    items: &[(bool, String)],
+    match_re: &Regex,
+    pattern: &str,
+) -> (usize, usize) {
+    let before_count = items.len();
+    if pattern.is_empty() {
+        return (before_count, before_count);
+    }
+    let mut after_filenames = std::collections::HashSet::new();
+    for (_, filename) in items {
+        if match_re.is_match(filename) {
+            let renamed = match_re.replace_all(filename, pattern).to_string();
+            after_filenames.insert(renamed);
+        } else {
+            after_filenames.insert(filename.clone());
+        }
+    }
+    (before_count, after_filenames.len())
+}
 
-    let mut elt = element! {App(dir: dir)};
+#[derive(Debug, PartialEq, Eq)]
+pub struct CliArgs {
+    pub dir: std::path::PathBuf,
+    pub confirm: bool,
+    pub prevent_delete: bool,
+    pub help: bool,
+}
+
+pub fn parse_cli_args<I, T>(args: I) -> Result<CliArgs, String>
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<str>,
+{
+    let mut dir: Option<std::path::PathBuf> = None;
+    let mut confirm = false;
+    let mut prevent_delete = false;
+    let mut help = false;
+
+    for arg in args {
+        let arg = arg.as_ref();
+        match arg {
+            "-h" | "--help" => {
+                help = true;
+            }
+            "-c" | "--confirm" | "-i" | "--interactive" => {
+                confirm = true;
+            }
+            "-s" | "--safe" => {
+                // --safe and -s also enable the confirm flag
+                confirm = true;
+                prevent_delete = true;
+            }
+            "-p" | "--prevent-delete" | "-n" | "--no-overwrite" | "--prevent-overwrite" => {
+                prevent_delete = true;
+            }
+            s if s.starts_with('-') => {
+                return Err(format!("Unknown option: {}", s));
+            }
+            s => {
+                if dir.is_some() {
+                    return Err(format!("Unexpected argument: {}", s));
+                }
+                dir = Some(std::path::PathBuf::from(s));
+            }
+        }
+    }
+
+    let dir = match dir {
+        Some(path) => match path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => return Err(format!("Could not access directory '{}': {}", path.display(), e)),
+        },
+        None => match std::env::current_dir() {
+            Ok(p) => match p.canonicalize() {
+                Ok(canon) => canon,
+                Err(_) => p,
+            },
+            Err(e) => return Err(format!("Could not determine current directory: {}", e)),
+        },
+    };
+
+    Ok(CliArgs {
+        dir,
+        confirm,
+        prevent_delete,
+        help,
+    })
+}
+
+pub fn print_help() {
+    println!("regname - Mass renamer TUI written in Rust");
+    println!();
+    println!("USAGE:");
+    println!("    regname [OPTIONS] [DIR]");
+    println!();
+    println!("OPTIONS:");
+    println!("    -c, --confirm, -i, --interactive");
+    println!("            Prompt for confirmation with a pop-up before executing rename");
+    println!("    -p, --prevent-delete, -n, --no-overwrite");
+    println!("            Prevent rename if before and after file count decreases");
+    println!("    -s, --safe");
+    println!("            Safe mode: enables both --prevent-delete and --confirm");
+    println!("    -h, --help");
+    println!("            Print help information");
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli_args = match parse_cli_args(&args) {
+        Ok(args) => args,
+        Err(err) => {
+            eprintln!("ERROR: {}", err);
+            std::process::exit(1);
+        }
+    };
+
+    if cli_args.help {
+        print_help();
+        std::process::exit(0);
+    }
+
+    let mut elt = element! {
+        App(
+            dir: cli_args.dir,
+            confirm: cli_args.confirm,
+            prevent_delete: cli_args.prevent_delete,
+        )
+    };
     smol::block_on(elt.fullscreen()).unwrap();
     print!("{}", elt.props.out_buffer);
     eprint!("{}", elt.props.err_buffer);
